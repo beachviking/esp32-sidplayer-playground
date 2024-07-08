@@ -1,14 +1,15 @@
 # esp32-sid-register-player-rlc
 
-This repo contains a register based sid player for the Aithinker ESP32 Audio board.
+This repo contains a register based sid player for the AI-Thinker ESP32 Audio board. 
 
 https://docs.ai-thinker.com/en/esp32-audio-kit
 
-This board features the ESP32-A1S module, which has a built-in I2S based audio DAC.
+The features the ESP32-A1S module, which has a built-in I2S based audio DAC.
 
 This project uses the board with the Arduino environment provided for by the PlatformIO plugin with Visual Studio Code. 
 
-Run length encoded register dump files of SID tunes can be stored on an SD card in a folder called "DMP3". Use the KEY5 button to play next song.
+Register dump files of SID tunes can be stored on an SD card in a folder called "DMP". Use the KEY5 button to play next song.
+The code also includes an option to use dynamic frame timings too. See code for more details.
 
 Original ReSID emulation version 0.16 provided by Dag Lem.
 https://github.com/daglem/reSID/
@@ -28,4 +29,4 @@ https://github.com/pschatzmann/arduino-audio-driver
 https://github.com/greiman/SdFat
 https://github.com/beachviking/arduino-sid-tools
  
-This solution was developped using PlatformIO, my platformio.ini file is included to show my setup. You probably need to tweak this one to work for you.
+This solution was developed using PlatformIO, my platformio.ini file is included to show my setup. You probably need to tweak this one to work for you.
