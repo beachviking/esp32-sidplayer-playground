@@ -38,7 +38,15 @@ const char *startFilePath="/SID/";
 
 // Oscilloscope display — runs on Core 0 so I2C never blocks audio on Core 1
 static SemaphoreHandle_t xDisplaySemaphore;
-static uint8_t sidRegsSnapshot[25]; // snapshot of SID registers 0xD400-0xD418
+
+// Shared frame data: per-voice samples (envelope-modulated) + register snapshot.
+// Two frames of 128 samples are kept so the trigger can always find a rising edge
+// in the first half and still have a full 128-sample window to display.
+struct ScopeFrame {
+    int16_t voice[3][256]; // rolling 2-frame buffer; newest 128 in [128..255]
+    uint8_t regs[25];      // SID registers 0xD400-0xD418 (for silence detection)
+};
+static ScopeFrame scopeFrame;
 
 // Store error strings in flash to save RAM.
 #define error(s) sd.errorHalt(&Serial, F(s))
@@ -62,7 +70,7 @@ uint8_t audiobuffer[BUFFER_SIZE];
 // Function prototypes
 void logoshow();
 void initScreen();
-void renderOscilloscope(uint8_t* regs);
+void renderOscilloscope(const ScopeFrame& frame);
 void displayTask(void* pvParam);
 
 void getNext() 
@@ -153,98 +161,123 @@ void loop() {
     return;
   }
 
-  size_t l = player.read(audiobuffer);
-  size_t i2s_bytes_written;
-  i2s_write(i2s_num, audiobuffer, l, &i2s_bytes_written, 100);
+  // Inline audio loop — replaces player.read() so we can capture per-voice samples.
+  // voice_output(i) returns waveform * envelope (pre-filter), giving ADSR-accurate levels.
+  {
+    SID* sid_ptr = player.getSID();
+    cycle_count dt = player.getDeltaT();
+    long spf = player.getSamplesPerFrame();
+    int16_t* ptr = (int16_t*)audiobuffer;
+    int stride = (int)(spf / 128);
+    if (stride < 1) stride = 1;
 
-  // Snapshot SID registers and signal the display task (runs on Core 0)
-  memcpy(sidRegsSnapshot, mem + 0xD400, 25);
+    // Shift previous frame into the first half; new samples fill the second half.
+    // This gives the trigger search a full 128-sample lookahead window.
+    for (int v = 0; v < 3; v++)
+      memmove(scopeFrame.voice[v], scopeFrame.voice[v] + 128, 128 * sizeof(int16_t));
+
+    for (long j = 0; j < spf; j++) {
+      sid_ptr->clock(dt);
+      int16_t sample = (int16_t)sid_ptr->output();
+      *ptr++ = sample; // L
+      *ptr++ = sample; // R
+
+      // Stride-sample per-voice output into the second half of the rolling buffer
+      int idx = (int)(j / stride);
+      if (idx < 128) {
+        for (int v = 0; v < 3; v++) {
+          // voice_output() range is roughly ±(2047*255) ≈ ±521985 (21-bit signed).
+          // Shift right by 4 to fit in int16_t with headroom.
+          scopeFrame.voice[v][128 + idx] = (int16_t)(sid_ptr->voice_output(v) >> 4);
+        }
+      }
+    }
+
+    size_t l = (size_t)(spf * 4);
+    size_t i2s_bytes_written;
+    i2s_write(i2s_num, audiobuffer, l, &i2s_bytes_written, 100);
+  }
+
+  // Snapshot SID registers (still used for silence detection) and signal display task
+  memcpy(scopeFrame.regs, mem + 0xD400, 25);
   xSemaphoreGive(xDisplaySemaphore);
 }
 
 
 // ---------------------------------------------------------------------------
-// Oscilloscope renderer — called from displayTask() on Core 0
-// Reads a snapshot of the 25 SID registers (0xD400-0xD418) and draws three
-// voice waveform lanes on the 128×64 OLED.
+// Oscilloscope renderer — called from displayTask() on Core 0.
+// Draws three voice lanes using actual per-voice audio samples (waveform *
+// envelope from reSID), so ADSR curves are visible in the waveform amplitude.
+//
+// Trigger: the first active voice is used as the sync reference. A rising
+// midpoint-crossing is found in its first 128 samples; all three voices are
+// then displayed starting at that same offset. This keeps waveforms stationary
+// and gives a common time reference across all lanes.
 //
 // Display layout (64 px tall):
 //   y=0..20   Voice 1  (21 px, center y=10)
 //   y=21..41  Voice 2  (21 px, center y=31)
 //   y=42..62  Voice 3  (21 px, center y=52)
 //   y=63      (unused)
-//
-// Waveform shown is synthesized from the SID register state: waveform type,
-// frequency (controls cycle count visible), and pulse width.  No library
-// modifications are required — mem[] is accessible via mos6502.h extern.
 // ---------------------------------------------------------------------------
-void renderOscilloscope(uint8_t* regs) {
+void renderOscilloscope(const ScopeFrame& frame) {
     display.clearDisplay();
 
-    uint8_t vol = regs[24] & 0x0F;  // master volume from 0xD418
+    uint8_t vol = frame.regs[24] & 0x0F;
+
+    // Find the first active voice to use as trigger reference
+    int ref_v = -1;
+    for (int v = 0; v < 3; v++) {
+        uint8_t ctrl  = frame.regs[v * 7 + 4];
+        bool    gate  = (ctrl & 0x01) != 0;
+        uint8_t wform = (ctrl >> 4) & 0x0F;
+        if (gate && wform != 0 && vol != 0) { ref_v = v; break; }
+    }
+
+    // Trigger: rising midpoint-crossing of the reference voice in the first half
+    // of the rolling buffer. The second half always has a full 128-sample window
+    // available after any trigger point found in [1..127].
+    int trigger = 0;
+    if (ref_v >= 0) {
+        int16_t mn = 32767, mx = -32767;
+        for (int i = 0; i < 128; i++) {
+            if (frame.voice[ref_v][i] < mn) mn = frame.voice[ref_v][i];
+            if (frame.voice[ref_v][i] > mx) mx = frame.voice[ref_v][i];
+        }
+        int16_t threshold = mn + (mx - mn) / 2;
+        for (int i = 1; i < 128; i++) {
+            if (frame.voice[ref_v][i - 1] < threshold && frame.voice[ref_v][i] >= threshold) {
+                trigger = i;
+                break;
+            }
+        }
+    }
 
     for (int v = 0; v < 3; v++) {
-        int r = v * 7;  // register base for this voice
-
-        uint16_t freq_reg = (uint16_t)regs[r]     | ((uint16_t)regs[r+1] << 8);
-        uint16_t pw_reg   = (uint16_t)regs[r+2]   | ((uint16_t)(regs[r+3] & 0x0F) << 8);
-        uint8_t  ctrl     = regs[r+4];
-
-        // Lane geometry
-        int lane_center = v * 21 + 10;
-        int lane_top    = v * 21 + 1;   // leave 1 px gap at top for visual separation
-        int lane_bottom = v * 21 + 19;  // leave 1 px gap at bottom
-        int lane_half   = 9;            // max amplitude deflection in pixels
-
+        int r = v * 7;
+        uint8_t ctrl  = frame.regs[r + 4];
         bool    gate  = (ctrl & 0x01) != 0;
-        uint8_t wform = (ctrl >> 4) & 0x0F;  // bits: 3=noise 2=pulse 1=saw 0=tri
+        uint8_t wform = (ctrl >> 4) & 0x0F;
+
+        int lane_center = v * 21 + 10;
+        int lane_top    = v * 21 + 1;
+        int lane_bottom = v * 21 + 19;
+        int lane_half   = 9;
 
         if (!gate || wform == 0 || vol == 0) {
-            // Voice silent — draw a flat centre line
             display.drawFastHLine(0, lane_center, 128, SSD1306_WHITE);
             continue;
         }
 
-        // Number of waveform cycles to fit across 128 pixels.
-        // SID freq: f = freq_reg * clockFreq / 2^24
-        //   with clockFreq=985248 Hz and PAL frame=1/50 s:
-        //   cycles/frame = freq_reg * 985248 / (16777216 * 50) ≈ freq_reg * 0.001175
-        float cycles = (float)freq_reg * 0.001175f;
-        if (cycles < 0.25f) cycles = 0.25f;
-        if (cycles > 16.0f) cycles = 16.0f;
-
-        float pw_ratio = (pw_reg > 0) ? (float)pw_reg / 4095.0f : 0.5f;
-        if (pw_ratio < 0.05f) pw_ratio = 0.05f;
-        if (pw_ratio > 0.95f) pw_ratio = 0.95f;
-
         int prev_y = lane_center;
-
         for (int x = 0; x < 128; x++) {
-            float phase = fmodf((float)x * cycles / 128.0f, 1.0f);
-            float amp = 0.0f;  // −1.0 .. +1.0
-
-            if (wform & 0x08) {
-                // Noise: deterministic pseudo-random for a stable snapshot look
-                uint16_t h = (uint16_t)(x * 251 + v * 431);
-                h ^= (uint16_t)(h >> 3);
-                h ^= (uint16_t)(h << 5);
-                h ^= (uint16_t)(h >> 7);
-                amp = (float)(h & 0x1F) / 15.5f - 1.0f;
-            } else if (wform & 0x04) {
-                // Pulse
-                amp = (phase < pw_ratio) ? 1.0f : -1.0f;
-            } else if (wform & 0x02) {
-                // Sawtooth (ascending, matching SID accumulator direction)
-                amp = phase * 2.0f - 1.0f;
-            } else {
-                // Triangle
-                amp = (phase < 0.5f) ? (phase * 4.0f - 1.0f)
-                                      : (3.0f - phase * 4.0f);
-            }
-
-            int y = lane_center - (int)(amp * (float)lane_half);
+            // Read from the rolling buffer starting at the trigger offset.
+            // trigger is in [0..127] and x in [0..127], so index is in [0..254].
+            float norm = (float)frame.voice[v][trigger + x] / 32767.0f;
+            if (norm > 1.0f) norm = 1.0f;
+            if (norm < -1.0f) norm = -1.0f;
+            int y = lane_center - (int)(norm * (float)lane_half);
             y = constrain(y, lane_top, lane_bottom);
-
             if (x > 0) {
                 display.drawLine(x - 1, prev_y, x, y, SSD1306_WHITE);
             }
@@ -259,7 +292,7 @@ void renderOscilloscope(uint8_t* regs) {
 void displayTask(void* pvParam) {
     for (;;) {
         if (xSemaphoreTake(xDisplaySemaphore, portMAX_DELAY) == pdTRUE) {
-            renderOscilloscope(sidRegsSnapshot);
+            renderOscilloscope(scopeFrame);
         }
     }
 }
