@@ -32,8 +32,13 @@
 #include "SdFat.h"
 #include "SPI.h"
 #include "SidTools.h"
+#include <math.h>
 
 const char *startFilePath="/SID/";
+
+// Oscilloscope display — runs on Core 0 so I2C never blocks audio on Core 1
+static SemaphoreHandle_t xDisplaySemaphore;
+static uint8_t sidRegsSnapshot[25]; // snapshot of SID registers 0xD400-0xD418
 
 // Store error strings in flash to save RAM.
 #define error(s) sd.errorHalt(&Serial, F(s))
@@ -57,6 +62,8 @@ uint8_t audiobuffer[BUFFER_SIZE];
 // Function prototypes
 void logoshow();
 void initScreen();
+void renderOscilloscope(uint8_t* regs);
+void displayTask(void* pvParam);
 
 void getNext() 
 {
@@ -121,6 +128,10 @@ void setup() {
   // setup button actions
   actions.add(PIN_AUDIO_KIT_NEXT_SONG_BUTTON, nextSong);
   actions.add(PIN_AUDIO_KIT_NEXT_TUNE_BUTTON, nextTune);
+
+  // Launch oscilloscope display task on Core 0 (audio runs on Core 1)
+  xDisplaySemaphore = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCore(displayTask, "display", 4096, NULL, 1, NULL, 0);
 }
 
 void loop() {
@@ -146,12 +157,117 @@ void loop() {
   size_t i2s_bytes_written;
   i2s_write(i2s_num, audiobuffer, l, &i2s_bytes_written, 100);
 
+  // Snapshot SID registers and signal the display task (runs on Core 0)
+  memcpy(sidRegsSnapshot, mem + 0xD400, 25);
+  xSemaphoreGive(xDisplaySemaphore);
 }
 
+
+// ---------------------------------------------------------------------------
+// Oscilloscope renderer — called from displayTask() on Core 0
+// Reads a snapshot of the 25 SID registers (0xD400-0xD418) and draws three
+// voice waveform lanes on the 128×64 OLED.
+//
+// Display layout (64 px tall):
+//   y=0..20   Voice 1  (21 px, center y=10)
+//   y=21..41  Voice 2  (21 px, center y=31)
+//   y=42..62  Voice 3  (21 px, center y=52)
+//   y=63      (unused)
+//
+// Waveform shown is synthesized from the SID register state: waveform type,
+// frequency (controls cycle count visible), and pulse width.  No library
+// modifications are required — mem[] is accessible via mos6502.h extern.
+// ---------------------------------------------------------------------------
+void renderOscilloscope(uint8_t* regs) {
+    display.clearDisplay();
+
+    uint8_t vol = regs[24] & 0x0F;  // master volume from 0xD418
+
+    for (int v = 0; v < 3; v++) {
+        int r = v * 7;  // register base for this voice
+
+        uint16_t freq_reg = (uint16_t)regs[r]     | ((uint16_t)regs[r+1] << 8);
+        uint16_t pw_reg   = (uint16_t)regs[r+2]   | ((uint16_t)(regs[r+3] & 0x0F) << 8);
+        uint8_t  ctrl     = regs[r+4];
+
+        // Lane geometry
+        int lane_center = v * 21 + 10;
+        int lane_top    = v * 21 + 1;   // leave 1 px gap at top for visual separation
+        int lane_bottom = v * 21 + 19;  // leave 1 px gap at bottom
+        int lane_half   = 9;            // max amplitude deflection in pixels
+
+        bool    gate  = (ctrl & 0x01) != 0;
+        uint8_t wform = (ctrl >> 4) & 0x0F;  // bits: 3=noise 2=pulse 1=saw 0=tri
+
+        if (!gate || wform == 0 || vol == 0) {
+            // Voice silent — draw a flat centre line
+            display.drawFastHLine(0, lane_center, 128, SSD1306_WHITE);
+            continue;
+        }
+
+        // Number of waveform cycles to fit across 128 pixels.
+        // SID freq: f = freq_reg * clockFreq / 2^24
+        //   with clockFreq=985248 Hz and PAL frame=1/50 s:
+        //   cycles/frame = freq_reg * 985248 / (16777216 * 50) ≈ freq_reg * 0.001175
+        float cycles = (float)freq_reg * 0.001175f;
+        if (cycles < 0.25f) cycles = 0.25f;
+        if (cycles > 16.0f) cycles = 16.0f;
+
+        float pw_ratio = (pw_reg > 0) ? (float)pw_reg / 4095.0f : 0.5f;
+        if (pw_ratio < 0.05f) pw_ratio = 0.05f;
+        if (pw_ratio > 0.95f) pw_ratio = 0.95f;
+
+        int prev_y = lane_center;
+
+        for (int x = 0; x < 128; x++) {
+            float phase = fmodf((float)x * cycles / 128.0f, 1.0f);
+            float amp = 0.0f;  // −1.0 .. +1.0
+
+            if (wform & 0x08) {
+                // Noise: deterministic pseudo-random for a stable snapshot look
+                uint16_t h = (uint16_t)(x * 251 + v * 431);
+                h ^= (uint16_t)(h >> 3);
+                h ^= (uint16_t)(h << 5);
+                h ^= (uint16_t)(h >> 7);
+                amp = (float)(h & 0x1F) / 15.5f - 1.0f;
+            } else if (wform & 0x04) {
+                // Pulse
+                amp = (phase < pw_ratio) ? 1.0f : -1.0f;
+            } else if (wform & 0x02) {
+                // Sawtooth (ascending, matching SID accumulator direction)
+                amp = phase * 2.0f - 1.0f;
+            } else {
+                // Triangle
+                amp = (phase < 0.5f) ? (phase * 4.0f - 1.0f)
+                                      : (3.0f - phase * 4.0f);
+            }
+
+            int y = lane_center - (int)(amp * (float)lane_half);
+            y = constrain(y, lane_top, lane_bottom);
+
+            if (x > 0) {
+                display.drawLine(x - 1, prev_y, x, y, SSD1306_WHITE);
+            }
+            prev_y = y;
+        }
+    }
+
+    display.display();
+}
+
+// FreeRTOS task — runs on Core 0; audio loop runs on Core 1
+void displayTask(void* pvParam) {
+    for (;;) {
+        if (xSemaphoreTake(xDisplaySemaphore, portMAX_DELAY) == pdTRUE) {
+            renderOscilloscope(sidRegsSnapshot);
+        }
+    }
+}
 
 void initScreen() {
     //LCD
     Wire.begin(MAKEPYTHON_ESP32_SDA, MAKEPYTHON_ESP32_SCL);
+    Wire.setClock(400000);  // 400 kHz — cuts I2C frame time from ~100ms to ~25ms
     // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
     if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
     { // Address 0x3C for 128x32
